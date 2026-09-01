@@ -1,3 +1,39 @@
+# mk-tap-s3-csv
+
+MadKudu's fork of [pipelinewise-tap-s3-csv](https://github.com/s7clarke10/pipelinewise-tap-s3-csv)
+(s7clarke10 variant, the Meltano Hub default). Everything upstream still works; the fork adds
+what MDI needs to pull customer S3 buckets (RGI-2438):
+
+## What this fork adds
+
+| Change | Why |
+|---|---|
+| Cross-account role login: `role_arn` + `external_id` (+ optional `aws_region`) | Customers grant access with an AWS role, not access keys. The session's credentials refresh themselves via STS before they expire, so long pulls keep running. The STS call itself is signed by the runtime's own identity (for example the ECS task role). |
+| `bucket` accepts a full `s3://bucket/folder` URL | Argo stores each connector's location as a URL (`s3_folder_path`). The folder part is prepended to every table's `search_prefix`. |
+| Gzipped files actually work | Upstream skipped its own library's decompression in both discovery and sync; both paths are now routed through it (`.gz` and `.zip`). |
+| Per-table `"format": "jsonl"` | Some customers deliver one JSON object per line instead of CSV (for example Couchbase usage exports). CSV stays the default. |
+
+Example config:
+
+```json
+{
+  "start_date": "2026-09-01T00:00:00Z",
+  "bucket": "s3://customer-bucket/exports",
+  "role_arn": "arn:aws:iam::111122223333:role/their-grant-role",
+  "external_id": "the-external-id-from-argo",
+  "aws_region": "us-west-2",
+  "tables": [
+    { "table_name": "events",   "search_pattern": "events\\..*\\.gz$",  "key_properties": ["event_key"], "format": "jsonl" },
+    { "table_name": "contacts", "search_pattern": "contacts\\.csv\\.gz$", "key_properties": ["contact_key"], "delimiter": "," }
+  ]
+}
+```
+
+Static keys / profile auth and `aws_endpoint_url` (point the tap at a local fake S3 for tests)
+work exactly as upstream. Original upstream README follows.
+
+---
+
 # pipelinewise-tap-s3-csv
 
 [![PyPI version](https://badge.fury.io/py/pipelinewise-tap-s3-csv.svg)](https://badge.fury.io/py/pipelinewise-tap-s3-csv)
