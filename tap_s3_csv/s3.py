@@ -13,12 +13,16 @@ import backoff
 import boto3
 import more_itertools
 from botocore.config import Config
+from botocore.credentials import DeferredRefreshableCredentials
 from botocore.exceptions import ClientError
+from botocore.session import get_session as get_botocore_session
 from singer import get_logger, utils
 from singer_encodings.csv import (  # pylint:disable=no-name-in-module
     SDC_EXTRA_COLUMN,
-    get_row_iterator,
+    get_row_iterators,
 )
+
+from tap_s3_csv import jsonl
 
 LOGGER = get_logger("tap_s3_csv")
 
@@ -53,6 +57,54 @@ def log_backoff_attempt(details):
     )
 
 
+def _assume_role_refresher(config: Dict):
+    """
+    Returns a function botocore calls whenever it needs fresh credentials
+    for the customer's role — at start, and again shortly before the STS
+    session expires. This is what lets a pull longer than the STS session
+    lifetime keep running.
+
+    MadKudu customers grant access with a cross-account role (role_arn +
+    external_id), the same parameters the legacy pull-custom lambda uses in
+    getAWSTemporaryCredentials.
+    """
+
+    def _refresh() -> Dict:
+        sts_kwargs = {}
+        # Same override the S3 clients honour — lets tests point STS at a
+        # local fake AWS. Unset in production.
+        if config.get("aws_endpoint_url"):
+            sts_kwargs["endpoint_url"] = config["aws_endpoint_url"]
+        # A fresh session on purpose: the STS call must be signed by the
+        # runtime's own identity (ECS task role / env credentials), never by
+        # the default session — whose credentials are the deferred ones this
+        # function produces, which would recurse into itself and deadlock.
+        sts = boto3.Session().client(
+            "sts", region_name=config.get("aws_region"), **sts_kwargs
+        )
+        params = {
+            "RoleArn": config["role_arn"],
+            "RoleSessionName": "mk-tap-s3-csv",
+            "DurationSeconds": int(config.get("sts_duration_seconds", 3600)),
+        }
+        if config.get("external_id"):
+            params["ExternalId"] = config["external_id"]
+        creds = sts.assume_role(**params)["Credentials"]
+        LOGGER.info(
+            "Assumed role %s, session valid until %s",
+            config["role_arn"],
+            creds["Expiration"],
+        )
+        return {
+            "access_key": creds["AccessKeyId"],
+            "secret_key": creds["SecretAccessKey"],
+            "token": creds["SessionToken"],
+            "expiry_time": creds["Expiration"].isoformat(),
+        }
+
+    return _refresh
+
+
 @retry_pattern()
 def setup_aws_client(config: Dict) -> None:
     """
@@ -60,6 +112,23 @@ def setup_aws_client(config: Dict) -> None:
     :param config: connection config
     """
     LOGGER.info("Attempting to create AWS session")
+
+    # Cross-account role authentication (MadKudu customers): the session's
+    # credentials refresh themselves via STS before they expire.
+    if config.get("role_arn"):
+        botocore_session = get_botocore_session()
+        botocore_session._credentials = (  # pylint:disable=protected-access
+            DeferredRefreshableCredentials(
+                method="sts-assume-role",
+                refresh_using=_assume_role_refresher(config),
+            )
+        )
+        if config.get("aws_region"):
+            botocore_session.set_config_variable(
+                "region", config["aws_region"]
+            )
+        boto3.setup_default_session(botocore_session=botocore_session)
+        return
 
     # Get the required parameters from config file and/or environment variables
     aws_access_key_id = config.get("aws_access_key_id") or os.environ.get(
@@ -83,6 +152,27 @@ def setup_aws_client(config: Dict) -> None:
     # AWS Profile based authentication
     else:
         boto3.setup_default_session(profile_name=aws_profile)
+
+
+def row_iterators_for_table(file_handle, table_spec: Dict, s3_path: str):
+    """
+    One place that decides how a file is read. Routes through the
+    compression layer (gzip/zip are inferred from the file name) and picks
+    the parser from the table's "format": CSV by default, JSON-lines when
+    the table spec says "jsonl".
+    """
+    options = {**table_spec, "file_name": s3_path}
+    if table_spec.get("format", "csv") == "jsonl":
+        return jsonl.get_row_iterators(
+            file_handle._raw_stream,  # pylint:disable=protected-access
+            options=options,
+            infer_compression=True,
+        )
+    return get_row_iterators(
+        file_handle._raw_stream,  # pylint:disable=protected-access
+        options=options,
+        infer_compression=True,
+    )
 
 
 def get_sampled_schema_for_table(config: Dict, table_spec: Dict) -> Dict:
@@ -192,43 +282,41 @@ def sample_file(
     :return: generator containing the samples as dictionaries
     """
     file_handle = get_file_handle(config, s3_path)
-    # _raw_stream seems like the wrong way to access this..
-    iterator = get_row_iterator(
-        file_handle._raw_stream, table_spec
-    )  # pylint:disable=protected-access
+    # Routed through the compression layer so gzipped files sample correctly;
+    # a zip archive yields one iterator per member.
+    iterators = row_iterators_for_table(file_handle, table_spec, s3_path)
 
     current_row = 0
 
     sampled_row_count = 0
 
-    headers = []
-    if iterator.fieldnames:
-        headers = iterator.fieldnames
+    for iterator in iterators:
+        headers = getattr(iterator, "fieldnames", None) or []
 
-    has_rows = False
+        has_rows = False
 
-    for row in iterator:
-        has_rows = True
-        if (current_row % sample_rate) == 0:
-            if row.get(SDC_EXTRA_COLUMN):
-                row.pop(SDC_EXTRA_COLUMN)
-            sampled_row_count += 1
-            if (sampled_row_count % 200) == 0:
+        for row in iterator:
+            has_rows = True
+            if (current_row % sample_rate) == 0:
+                if row.get(SDC_EXTRA_COLUMN):
+                    row.pop(SDC_EXTRA_COLUMN)
+                sampled_row_count += 1
+                if (sampled_row_count % 200) == 0:
+                    LOGGER.info(
+                        "Sampled %s rows from %s", sampled_row_count, s3_path
+                    )
+                yield row
+
+            current_row += 1
+
+        if not has_rows:
+            if headers:
                 LOGGER.info(
-                    "Sampled %s rows from %s", sampled_row_count, s3_path
+                    "No records, just empty file with headers. Yielding header "
+                    "row to create an empty file"
                 )
-            yield row
-
-        current_row += 1
-
-    if not has_rows:
-        if headers:
-            LOGGER.info(
-                "No records, just empty file with headers. Yielding header "
-                "row to create an empty file"
-            )
-            row = dict.fromkeys(headers)
-            yield row
+                row = dict.fromkeys(headers)
+                yield row
 
     LOGGER.info("Sampled %s rows from %s", sampled_row_count, s3_path)
 
