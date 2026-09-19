@@ -112,7 +112,10 @@ class TestBucketUrl:
 
 class TestAssumeRoleRefresher:
     @mock_aws
-    def test_refresh_returns_botocore_credential_shape(self):
+    def test_refresh_returns_botocore_credential_shape(self, monkeypatch):
+        # A developer with AWS_PROFILE set would otherwise have botocore resolve
+        # that profile instead of moto's fake credentials, and fail here.
+        monkeypatch.delenv("AWS_PROFILE", raising=False)
         refresh = s3._assume_role_refresher(  # pylint:disable=protected-access
             {
                 "role_arn": "arn:aws:iam::123456789012:role/customer",
