@@ -88,6 +88,35 @@ def do_sync(config: Dict, catalog: Dict, state: Dict) -> None:
     LOGGER.info("Done syncing.")
 
 
+def apply_bucket_url(config: Dict) -> None:
+    """
+    Accept `bucket` given as a full s3:// URL, e.g. "s3://their-bucket/exports/".
+
+    MadKudu addition: Argo stores each connector's location as s3_folder_path
+    (a URL), not as a bucket/prefix pair. When the URL carries a folder, that
+    folder is prepended to every table's search_prefix so table specs stay
+    relative to the customer's folder.
+    """
+    bucket = config.get("bucket", "")
+    if not bucket.startswith("s3://"):
+        return
+
+    without_scheme = bucket[len("s3://"):]
+    bucket_name, _, base_prefix = without_scheme.partition("/")
+    if not bucket_name:
+        raise ValueError(f"bucket is an s3:// URL with no bucket name: {bucket!r}")
+    config["bucket"] = bucket_name
+
+    base_prefix = base_prefix.strip("/")
+    if not base_prefix:
+        return
+    for table in config.get("tables", []):
+        existing = (table.get("search_prefix") or "").strip("/")
+        table["search_prefix"] = "/".join(
+            part for part in (base_prefix, existing) if part
+        )
+
+
 @singer.utils.handle_top_exception(LOGGER)
 def main() -> None:
     """
@@ -99,6 +128,7 @@ def main() -> None:
 
     # Reassign the config tables to the validated object
     config["tables"] = CONFIG_CONTRACT(config.get("tables", {}))
+    apply_bucket_url(config)
 
     try:
         for _ in s3.list_files_in_bucket(

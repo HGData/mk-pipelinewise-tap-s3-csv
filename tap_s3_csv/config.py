@@ -4,7 +4,7 @@ Tap configuration related stuff
 
 from __future__ import annotations
 
-from voluptuous import Optional, Required, Schema
+from voluptuous import Any, Optional, Required, Schema
 
 CONFIG_CONTRACT = Schema(
     [
@@ -13,6 +13,9 @@ CONFIG_CONTRACT = Schema(
             Required("search_pattern"): str,
             Optional("key_properties"): [str],
             Optional("search_prefix"): str,
+            # MadKudu addition: how the file content is parsed. CSV is the
+            # default; "jsonl" reads one JSON object per line.
+            Optional("format"): Any("csv", "jsonl"),
             Optional("date_overrides"): [str],
             Optional("string_overrides"): [str],
             Optional("datatype_overrides"): object,

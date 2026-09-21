@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import csv
 import sys
+from itertools import chain
 from typing import Dict
 
 from singer import (
@@ -19,10 +20,6 @@ from singer import (
     write_record,
     write_state,
 )
-from singer_encodings.csv import (  # pylint:disable=no-name-in-module
-    get_row_iterator,
-)
-
 from tap_s3_csv import s3
 
 LOGGER = get_logger("tap_s3_csv")
@@ -123,13 +120,15 @@ def sync_table_file(
     # need to be fixed. The other consequence of this could be larger
     # memory consumption but that's acceptable as well.
     csv.field_size_limit(sys.maxsize)
-    iterator = get_row_iterator(
-        s3_file_handle._raw_stream, table_spec
-    )  # pylint:disable=protected-access
+    # Routed through the compression layer so gzipped files sync correctly;
+    # the parser (CSV or JSON-lines) comes from the table's "format" setting.
+    iterators = s3.row_iterators_for_table(s3_file_handle, table_spec, s3_path)
 
     records_synced = 0
 
-    for row in iterator:
+    # Flattened: a zip archive yields one iterator per member, and every member
+    # of the file is one stream of rows as far as this loop is concerned.
+    for row in chain.from_iterable(iterators):
         time_extracted = utils.now()
 
         custom_columns = {
