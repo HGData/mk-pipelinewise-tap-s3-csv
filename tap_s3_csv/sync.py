@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import csv
 import sys
+from itertools import chain
 from typing import Dict
 
 from singer import (
@@ -125,27 +126,28 @@ def sync_table_file(
 
     records_synced = 0
 
-    for iterator in iterators:
-        for row in iterator:
-            time_extracted = utils.now()
+    # Flattened: a zip archive yields one iterator per member, and every member
+    # of the file is one stream of rows as far as this loop is concerned.
+    for row in chain.from_iterable(iterators):
+        time_extracted = utils.now()
 
-            custom_columns = {
-                s3.SDC_SOURCE_BUCKET_COLUMN: bucket,
-                s3.SDC_SOURCE_FILE_COLUMN: s3_path,
-                # index zero, +1 for header row
-                s3.SDC_SOURCE_LINENO_COLUMN: records_synced + 2,
-            }
-            if config.get("set_empty_values_null", False):
-                row = set_empty_values_null(row)
+        custom_columns = {
+            s3.SDC_SOURCE_BUCKET_COLUMN: bucket,
+            s3.SDC_SOURCE_FILE_COLUMN: s3_path,
+            # index zero, +1 for header row
+            s3.SDC_SOURCE_LINENO_COLUMN: records_synced + 2,
+        }
+        if config.get("set_empty_values_null", False):
+            row = set_empty_values_null(row)
 
-            rec = {**row, **custom_columns}
+        rec = {**row, **custom_columns}
 
-            with Transformer() as transformer:
-                to_write = transformer.transform(
-                    rec, stream["schema"], metadata.to_map(stream["metadata"])
-                )
+        with Transformer() as transformer:
+            to_write = transformer.transform(
+                rec, stream["schema"], metadata.to_map(stream["metadata"])
+            )
 
-            write_record(table_name, to_write, time_extracted=time_extracted)
-            records_synced += 1
+        write_record(table_name, to_write, time_extracted=time_extracted)
+        records_synced += 1
 
     return records_synced
