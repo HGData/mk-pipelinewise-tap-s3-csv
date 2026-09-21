@@ -1,10 +1,12 @@
 name: CI
 
+# Upstream's own workflow. Its first step starts a Minio server with
+# `docker compose up -d`, and our runners cannot pull the minio/minio image, so
+# every job fails within seconds before any code runs. Left in place, but only
+# on demand: the lint and unit tests it would have run are covered by test.yml,
+# and the integration tests need a Minio anyone running this by hand can provide.
 on:
-  pull_request:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 
 env:
   LOGGING_CONF_FILE: ./sample_logging.conf

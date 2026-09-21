@@ -1,0 +1,24 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        # Install the tap itself so the tests run against its declared
+        # dependencies. moto backs the assume-role test; pylint is the same
+        # version the project pins for development.
+        run: pip install -e . pytest moto "pylint==3.2.5"
+      - name: Lint
+        run: pylint --rcfile pylintrc tap_s3_csv/
+      - name: Unit tests
+        run: pytest tests/unit -v
