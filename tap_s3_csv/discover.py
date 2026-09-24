@@ -49,7 +49,7 @@ def discover_schema(config: Dict, table_spec: Dict) -> Dict:
     if not sampled_schema and not config.get("warning_if_no_files", False):
         raise ValueError(
             f"{table_spec.get('search_prefix', '')} - "
-            "{table_spec.get('search_pattern', '')} "
+            f"{table_spec.get('search_pattern', '')} "
             "file(s) has no data and cannot analyse the content to generate "
             "the required schema."
         )

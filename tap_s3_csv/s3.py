@@ -16,7 +16,7 @@ from botocore.config import Config
 from botocore.credentials import DeferredRefreshableCredentials
 from botocore.exceptions import ClientError
 from botocore.session import get_session as get_botocore_session
-from singer import get_logger, utils
+from singer import get_logger
 from singer_encodings.csv import (  # pylint:disable=no-name-in-module
     SDC_EXTRA_COLUMN,
     get_row_iterators,
@@ -184,8 +184,11 @@ def get_sampled_schema_for_table(config: Dict, table_spec: Dict) -> Dict:
     """
     LOGGER.info("Sampling records to determine table schema.")
 
-    modified_since = utils.strptime_with_tz(config["start_date"])
-    s3_files_gen = get_input_files_for_table(config, table_spec, modified_since)
+    # Learn the columns from the newest matching files, whatever their age: sample_files keeps the
+    # last max_files of a list sorted oldest first. start_date only decides which files are synced.
+    # Sampling only files newer than it failed every run from a tenant's first day on this tap until
+    # its next file arrived, because there was nothing to learn the columns from.
+    s3_files_gen = get_input_files_for_table(config, table_spec)
 
     if table_spec.get("guess_types", True):
         samples = list(sample_files(config, table_spec, s3_files_gen))
@@ -452,7 +455,7 @@ def get_input_files_for_table(
         if warning_if_no_files:
             LOGGER.warning(
                 f'No files found in bucket "{bucket}" that matches prefix "'
-                '{prefix}" and pattern "{pattern}"'
+                f'{prefix}" and pattern "{pattern}"'
             )
         else:
             if prefix:
