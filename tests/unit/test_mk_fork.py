@@ -1,16 +1,19 @@
 """
 Tests for the MadKudu fork changes: gzip routing, the jsonl format option,
-s3:// bucket URLs, and the assume-role credential refresher.
+s3:// bucket URLs, the assume-role credential refresher, and sampling that
+ignores start_date.
 """
 
 import gzip
 import io
 import json
+import re
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from moto import mock_aws
 
-from tap_s3_csv import apply_bucket_url, jsonl, s3
+from tap_s3_csv import apply_bucket_url, discover, jsonl, s3
 
 
 def _gz(data: bytes) -> io.BytesIO:
@@ -133,3 +136,61 @@ class TestAssumeRoleRefresher:
         assert creds["access_key"]
         # expiry must parse as ISO so botocore can schedule the next refresh
         assert "T" in creds["expiry_time"]
+
+
+class TestSamplingIgnoresStartDate:
+    """Columns are learned from the newest files whatever their age; start_date
+    only decides which files are synced."""
+
+    CONFIG = {"bucket": "b", "start_date": "2026-09-24T07:35:35Z"}
+    TABLE = {
+        "table_name": "events",
+        "search_pattern": r"\.csv$",
+        "key_properties": ["event_key"],
+    }
+
+    @staticmethod
+    def _files(hours):
+        base = datetime(2026, 9, 20, tzinfo=timezone.utc)
+        return [
+            {"Key": f"event/{h:03d}.csv", "LastModified": base + timedelta(hours=h), "Size": 10}
+            for h in hours
+        ]
+
+    @staticmethod
+    def _fake_bucket(monkeypatch, files):
+        sampled = []
+        monkeypatch.setattr(s3, "list_files_in_bucket", lambda *a, **k: list(files))
+
+        def fake_sample_file(config, table_spec, s3_path, sample_rate):
+            sampled.append(s3_path)
+            yield {"event_key": "1", "contact_key": "a@b.c"}
+
+        monkeypatch.setattr(s3, "sample_file", fake_sample_file)
+        return sampled
+
+    def test_columns_come_from_files_older_than_the_start_date(self, monkeypatch):
+        # Every file predates start_date: the state right after a tenant moves to this tap.
+        self._fake_bucket(monkeypatch, self._files(range(3)))
+        schema = s3.get_sampled_schema_for_table(dict(self.CONFIG), dict(self.TABLE))
+        assert {"event_key", "contact_key"} <= set(schema["properties"])
+
+    def test_the_newest_files_are_sampled(self, monkeypatch):
+        sampled = self._fake_bucket(monkeypatch, self._files([5, 1, 7, 3, 0, 6, 2, 4]))
+        s3.get_sampled_schema_for_table(dict(self.CONFIG), dict(self.TABLE))
+        assert sampled == [f"event/{h:03d}.csv" for h in (3, 4, 5, 6, 7)]
+
+    def test_sync_still_skips_files_older_than_the_start_date(self, monkeypatch):
+        self._fake_bucket(monkeypatch, self._files(range(3)))
+        since = datetime(2026, 9, 24, 7, 35, 35, tzinfo=timezone.utc)
+        assert not list(s3.get_input_files_for_table(dict(self.CONFIG), dict(self.TABLE), since))
+
+    def test_a_table_with_no_matching_file_still_fails(self, monkeypatch):
+        self._fake_bucket(monkeypatch, [])
+        with pytest.raises(Exception, match="No files found"):
+            s3.get_sampled_schema_for_table(dict(self.CONFIG), dict(self.TABLE))
+
+    def test_the_no_data_error_names_the_search_pattern(self, monkeypatch):
+        monkeypatch.setattr(s3, "get_sampled_schema_for_table", lambda config, spec: {})
+        with pytest.raises(ValueError, match=re.escape(self.TABLE["search_pattern"])):
+            discover.discover_schema(dict(self.CONFIG), dict(self.TABLE))

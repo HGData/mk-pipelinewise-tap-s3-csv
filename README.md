@@ -12,6 +12,7 @@ what MDI needs to pull customer S3 buckets (RGI-2438):
 | `bucket` accepts a full `s3://bucket/folder` URL | Argo stores each connector's location as a URL (`s3_folder_path`). The folder part is prepended to every table's `search_prefix`. |
 | Gzipped files actually work | Upstream skipped its own library's decompression in both discovery and sync; both paths are now routed through it (`.gz` and `.zip`). |
 | Per-table `"format": "jsonl"` | Some customers deliver one JSON object per line instead of CSV (for example Couchbase usage exports). CSV stays the default. |
+| Columns are learned from the newest files, whatever their age | Upstream only sampled files newer than `start_date`, so every run from a tenant's first day until its next file failed with "has no data". `start_date` and the bookmark still decide which files are synced, and a table with no matching file at all still fails. |
 
 Example config:
 
