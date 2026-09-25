@@ -85,6 +85,82 @@ class TestFormatRouting:
         ]
 
 
+def _rows(stream, table_spec, s3_path):
+    readers = s3.row_iterators_for_table(_FakeHandle(stream), table_spec, s3_path)
+    return [dict(r) for reader in readers for r in reader]
+
+
+class TestGzipFromContent:
+    def test_gzipped_csv_named_csv_is_read(self):
+        assert _rows(_gz(b"a,b\n1,x\n"), {}, "exports/day.csv") == [
+            {"a": "1", "b": "x"}
+        ]
+
+    def test_plain_csv_is_still_read_as_text(self):
+        assert _rows(io.BytesIO(b"a,b\n1,x\n"), {}, "exports/day.csv") == [
+            {"a": "1", "b": "x"}
+        ]
+
+    def test_gzipped_json_lines_named_json_are_read(self):
+        assert _rows(
+            _gz(b'{"a": "1"}\n'), {"format": "jsonl"}, "exports/day.json"
+        ) == [{"a": "1"}]
+
+    def test_empty_file_is_not_gzip(self):
+        assert _rows(io.BytesIO(b""), {}, "exports/day.csv") == []
+
+
+class TestEscapeChar:
+    SPEC = {"escape_char": "\\"}
+
+    def test_escaped_delimiter_stays_in_the_value(self):
+        data = b"hit,type\n[Ready # Yes\\, I'm ready] - button,feature\n"
+        assert _rows(io.BytesIO(data), self.SPEC, "day.csv") == [
+            {"hit": "[Ready # Yes, I'm ready] - button", "type": "feature"}
+        ]
+
+    def test_without_it_the_value_is_split(self):
+        # Why the setting exists: the library reader cuts the value at the comma.
+        data = b"hit,type\nYes\\, ready,feature\n"
+        assert _rows(io.BytesIO(data), {}, "day.csv") == [
+            {"hit": "Yes\\", "type": " ready", "_sdc_extra": ["feature"]}
+        ]
+
+    def test_quote_marks_are_ordinary_characters(self):
+        data = b'hit,type\n"Payroll" page,page\n/ Payroll - "Payroll",page\n'
+        assert _rows(io.BytesIO(data), self.SPEC, "day.csv") == [
+            {"hit": '"Payroll" page', "type": "page"},
+            {"hit": '/ Payroll - "Payroll"', "type": "page"},
+        ]
+
+    def test_gzipped_file_named_csv_with_escapes(self):
+        data = b"hit,type\nYes\\, ready,feature\n"
+        assert _rows(_gz(data), self.SPEC, "day.csv") == [
+            {"hit": "Yes, ready", "type": "feature"}
+        ]
+
+    def test_other_delimiter(self):
+        data = b"a~b\nx\\~y~z\n"
+        assert _rows(io.BytesIO(data), {**self.SPEC, "delimiter": "~"}, "d.csv") == [
+            {"a": "x~y", "b": "z"}
+        ]
+
+    def test_extra_fields_and_null_bytes_as_the_library_does(self):
+        data = b"a,b\n1\x00,2,3\n"
+        assert _rows(io.BytesIO(data), self.SPEC, "day.csv") == [
+            {"a": "1", "b": "2", "_sdc_extra": ["3"]}
+        ]
+
+    def test_missing_key_properties_header_raises(self):
+        with pytest.raises(ValueError, match="missing required headers"):
+            _rows(io.BytesIO(b"a,b\n1,2\n"), {**self.SPEC, "key_properties": ["id"]}, "d.csv")
+
+    def test_config_accepts_it(self):
+        from tap_s3_csv.config import CONFIG_CONTRACT
+
+        CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": "\\"}])
+
+
 class TestBucketUrl:
     def test_plain_bucket_name_is_untouched(self):
         config = {"bucket": "my-bucket", "tables": [{"search_prefix": "x"}]}
