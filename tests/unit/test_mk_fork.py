@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from moto import mock_aws
 
-from tap_s3_csv import apply_bucket_url, discover, jsonl, s3
+from tap_s3_csv import apply_bucket_url, discover, jsonl, s3, sync
 
 
 def _gz(data: bytes) -> io.BytesIO:
@@ -159,6 +159,36 @@ class TestEscapeChar:
         from tap_s3_csv.config import CONFIG_CONTRACT
 
         CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": "\\"}])
+
+
+class TestKeysTheSampleMissed:
+    SDC = ["_sdc_source_bucket", "_sdc_source_file", "_sdc_source_lineno"]
+
+    def _sync(self, monkeypatch, lines, known):
+        written, schemas = [], []
+        payload = "\n".join(json.dumps(r) for r in lines).encode()
+        monkeypatch.setattr(s3, "get_file_handle", lambda config, path: _FakeHandle(_gz(payload)))
+        monkeypatch.setattr(sync, "write_record", lambda name, rec, time_extracted=None: written.append(rec))
+        monkeypatch.setattr(sync, "write_schema", lambda name, schema, keys: schemas.append((name, sorted(schema["properties"]), keys)))
+        stream = {
+            "schema": {"type": "object", "properties": {k: {"type": ["null", "string"]} for k in known + self.SDC}},
+            "metadata": [{"breadcrumb": [], "metadata": {"selected": True, "table-key-properties": ["event_key"]}}],
+        }
+        count = sync.sync_table_file({"bucket": "b"}, "day.json.gz", {"table_name": "events", "format": "jsonl"}, stream)
+        return count, written, schemas
+
+    def test_a_rare_key_is_kept_on_every_row_that_has_it(self, monkeypatch):
+        lines = [{"event_key": "1"}, {"event_key": "2", "template": "Org chart"}, {"event_key": "3", "template": "Kanban"}]
+        count, written, schemas = self._sync(monkeypatch, lines, ["event_key"])
+        assert count == 3
+        assert [r.get("template") for r in written] == [None, "Org chart", "Kanban"]
+        # The schema is sent again once, with the new key, before the first row that has it.
+        assert schemas == [("events", sorted(["event_key", "template"] + self.SDC), ["event_key"])]
+
+    def test_no_new_key_sends_no_new_schema(self, monkeypatch):
+        count, written, schemas = self._sync(monkeypatch, [{"event_key": "1", "template": "x"}], ["event_key", "template"])
+        assert (count, schemas) == (1, [])
+        assert written[0]["template"] == "x"
 
 
 class TestBucketUrl:

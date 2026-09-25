@@ -18,6 +18,7 @@ from singer import (
     utils,
     write_bookmark,
     write_record,
+    write_schema,
     write_state,
 )
 from tap_s3_csv import s3
@@ -95,6 +96,26 @@ def set_empty_values_null(input_row):
     return ret
 
 
+def add_new_keys(table_name: str, stream: Dict, rec: Dict, s3_path: str) -> None:
+    """
+    MadKudu addition: the schema was learned from a sample of rows, so a JSON
+    key that only a few rows carry can be missing from it, and the Transformer
+    would drop it from every row. A key the schema does not have yet is added
+    as text, and the schema is sent again before the row is written.
+    """
+    properties = stream["schema"]["properties"]
+    new_keys = sorted(rec.keys() - properties.keys())
+    if not new_keys:
+        return
+    for key in new_keys:
+        properties[key] = {"type": ["null", "string"]}
+    LOGGER.info('New columns %s in "%s"; sending the schema again.', new_keys, s3_path)
+    key_properties = metadata.get(
+        metadata.to_map(stream["metadata"]), (), "table-key-properties"
+    )
+    write_schema(table_name, stream["schema"], key_properties)
+
+
 def sync_table_file(
     config: Dict, s3_path: str, table_spec: Dict, stream: Dict
 ) -> int:
@@ -141,6 +162,7 @@ def sync_table_file(
             row = set_empty_values_null(row)
 
         rec = {**row, **custom_columns}
+        add_new_keys(table_name, stream, rec, s3_path)
 
         with Transformer() as transformer:
             to_write = transformer.transform(
