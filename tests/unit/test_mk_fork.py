@@ -200,6 +200,15 @@ class TestEscapeChar:
 
         CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": "\\"}])
 
+    def test_config_rejects_more_than_one_character(self):
+        from voluptuous import Invalid
+
+        from tap_s3_csv.config import CONFIG_CONTRACT
+
+        for bad in ("\\\\", ""):
+            with pytest.raises(Invalid):
+                CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": bad}])
+
 
 class TestKeysTheSampleMissed:
     SDC = ["_sdc_source_bucket", "_sdc_source_file", "_sdc_source_lineno"]
@@ -229,6 +238,22 @@ class TestKeysTheSampleMissed:
         count, written, schemas = self._sync(monkeypatch, [{"event_key": "1", "template": "x"}], ["event_key", "template"])
         assert (count, schemas) == (1, [])
         assert written[0]["template"] == "x"
+
+    def test_a_key_differing_only_in_case_goes_into_the_known_spelling(self, monkeypatch):
+        # Two spellings of one name would be one column in Redshift and fail the load.
+        lines = [{"event_key": "1", "Email": "a@x"}, {"event_key": "2", "email": "b@x", "EMAIL": "c@x"}]
+        count, written, schemas = self._sync(monkeypatch, lines, ["event_key", "email"])
+        assert (count, schemas) == (2, [])
+        assert [{k: v for k, v in r.items() if not k.startswith("_sdc")} for r in written] == [
+            {"event_key": "1", "email": "a@x"}, {"event_key": "2", "email": "b@x"}
+        ]
+
+    def test_two_new_spellings_become_one_column(self, monkeypatch):
+        lines = [{"event_key": "1", "Tmpl": "a"}, {"event_key": "2", "tmpl": "b"}]
+        count, written, schemas = self._sync(monkeypatch, lines, ["event_key"])
+        assert [r.get("Tmpl") for r in written] == ["a", "b"]
+        assert all("tmpl" not in r for r in written)
+        assert schemas == [("events", sorted(["event_key", "Tmpl"] + self.SDC), ["event_key"])]
 
 
 class TestBucketUrl:

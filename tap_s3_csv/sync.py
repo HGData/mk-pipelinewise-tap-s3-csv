@@ -102,13 +102,29 @@ def add_new_keys(table_name: str, stream: Dict, rec: Dict, s3_path: str) -> None
     key that only a few rows carry can be missing from it, and the Transformer
     would drop it from every row. A key the schema does not have yet is added
     as text, and the schema is sent again before the row is written.
+
+    A key that differs from a known one only in case ("Email" next to
+    "email") is folded into the known spelling instead: the loader and
+    Redshift fold column names to lower case, so two spellings would clash
+    as one column.
     """
     properties = stream["schema"]["properties"]
-    new_keys = sorted(rec.keys() - properties.keys())
+    if rec.keys() <= properties.keys():
+        return
+    known = {key.lower(): key for key in properties}
+    new_keys = []
+    for key in sorted(rec.keys() - properties.keys()):
+        spelling = known.get(key.lower())
+        if spelling is None:
+            properties[key] = {"type": ["null", "string"]}
+            known[key.lower()] = key
+            new_keys.append(key)
+        elif rec.get(spelling) is None:
+            rec[spelling] = rec.pop(key)
+        else:
+            rec.pop(key)
     if not new_keys:
         return
-    for key in new_keys:
-        properties[key] = {"type": ["null", "string"]}
     LOGGER.info('New columns %s in "%s"; sending the schema again.', new_keys, s3_path)
     key_properties = metadata.get(
         metadata.to_map(stream["metadata"]), (), "table-key-properties"
