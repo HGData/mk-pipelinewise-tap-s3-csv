@@ -4,6 +4,7 @@ Modules containing all AWS S3 related features
 
 from __future__ import annotations, division
 
+import io
 import itertools
 import os
 import re
@@ -22,9 +23,32 @@ from singer_encodings.csv import (  # pylint:disable=no-name-in-module
     get_row_iterators,
 )
 
-from tap_s3_csv import jsonl
+from tap_s3_csv import escaped_csv, jsonl
 
 LOGGER = get_logger("tap_s3_csv")
+
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+class EndIsEmpty(io.RawIOBase):
+    """
+    The S3 body as a plain raw stream. The body boto3 hands back (urllib3)
+    closes itself once all its bytes are read, and io.BufferedReader treats a
+    closed raw stream as "read of closed file" rather than as the end of the
+    data. This reports the end as an empty read, as a file does.
+    """
+
+    def __init__(self, stream):
+        super().__init__()
+        self._stream = stream
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        data = self._stream.read(len(buffer)) or b""
+        buffer[: len(data)] = data
+        return len(data)
 
 SDC_SOURCE_BUCKET_COLUMN = "_sdc_source_bucket"
 SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
@@ -157,22 +181,31 @@ def setup_aws_client(config: Dict) -> None:
 def row_iterators_for_table(file_handle, table_spec: Dict, s3_path: str):
     """
     One place that decides how a file is read. Routes through the
-    compression layer (gzip/zip are inferred from the file name) and picks
-    the parser from the table's "format": CSV by default, JSON-lines when
-    the table spec says "jsonl".
+    compression layer and picks the parser from the table's "format": CSV by
+    default, JSON-lines when the table spec says "jsonl", and CSV with an
+    escape character when it sets "escape_char".
+
+    Gzip and zip are inferred from the file name, and gzip also from the
+    file's first two bytes: some customers send gzipped files named .csv,
+    which Redshift's COPY ... GZIP read whatever the name.
     """
-    options = {**table_spec, "file_name": s3_path}
+    stream = io.BufferedReader(
+        EndIsEmpty(file_handle._raw_stream),  # pylint:disable=protected-access
+        buffer_size=1 << 20,
+    )
+    file_name = s3_path
+    if not s3_path.endswith((".gz", ".zip")) and stream.peek(2)[:2] == GZIP_MAGIC:
+        file_name = s3_path + ".gz"
+    options = {**table_spec, "file_name": file_name}
     if table_spec.get("format", "csv") == "jsonl":
         return jsonl.get_row_iterators(
-            file_handle._raw_stream,  # pylint:disable=protected-access
-            options=options,
-            infer_compression=True,
+            stream, options=options, infer_compression=True
         )
-    return get_row_iterators(
-        file_handle._raw_stream,  # pylint:disable=protected-access
-        options=options,
-        infer_compression=True,
-    )
+    if table_spec.get("escape_char"):
+        return escaped_csv.get_row_iterators(
+            stream, options=options, infer_compression=True
+        )
+    return get_row_iterators(stream, options=options, infer_compression=True)
 
 
 def get_sampled_schema_for_table(config: Dict, table_spec: Dict) -> Dict:

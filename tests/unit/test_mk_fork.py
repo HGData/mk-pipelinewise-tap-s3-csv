@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from moto import mock_aws
 
-from tap_s3_csv import apply_bucket_url, discover, jsonl, s3
+from tap_s3_csv import apply_bucket_url, discover, jsonl, s3, sync
 
 
 def _gz(data: bytes) -> io.BytesIO:
@@ -83,6 +83,177 @@ class TestFormatRouting:
         assert [dict(r) for reader in readers for r in reader] == [
             {"a": "1", "b": "x"}
         ]
+
+
+def _rows(stream, table_spec, s3_path):
+    readers = s3.row_iterators_for_table(_FakeHandle(stream), table_spec, s3_path)
+    return [dict(r) for reader in readers for r in reader]
+
+
+class _SelfClosingBody:
+    """Like the urllib3 body behind boto3's StreamingBody: it closes itself once all its bytes are read."""
+
+    def __init__(self, data: bytes):
+        self._buf, self._size, self.closed = io.BytesIO(data), len(data), False
+
+    def readable(self):
+        return True
+
+    def read(self, amt=-1):
+        data = self._buf.read(amt)
+        self.closed = self._buf.tell() >= self._size
+        return data
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        buffer[: len(data)] = data
+        return len(data)
+
+
+class TestS3BodyThatClosesItself:
+    # The real S3 body closes itself at the end of its data; reading it must end the rows, not raise
+    # "read of closed file" (which is what broke the first dev pulls of this change).
+    def test_gzipped_csv_named_csv(self):
+        assert _rows(_SelfClosingBody(_gz(b"a,b\n1,x\n").getvalue()), {}, "day.csv") == [{"a": "1", "b": "x"}]
+
+    def test_plain_csv(self):
+        assert _rows(_SelfClosingBody(b"a,b\n1,x\n2,y\n"), {}, "day.csv") == [
+            {"a": "1", "b": "x"}, {"a": "2", "b": "y"}
+        ]
+
+    def test_json_lines(self):
+        assert _rows(_SelfClosingBody(b'{"a": "1"}\n{"a": "2"}\n'), {"format": "jsonl"}, "d.json") == [
+            {"a": "1"}, {"a": "2"}
+        ]
+
+    def test_escaped_csv(self):
+        assert _rows(_SelfClosingBody(b"a,b\nx\\,y,z\n"), {"escape_char": "\\"}, "d.csv") == [{"a": "x,y", "b": "z"}]
+
+
+class TestGzipFromContent:
+    def test_gzipped_csv_named_csv_is_read(self):
+        assert _rows(_gz(b"a,b\n1,x\n"), {}, "exports/day.csv") == [
+            {"a": "1", "b": "x"}
+        ]
+
+    def test_plain_csv_is_still_read_as_text(self):
+        assert _rows(io.BytesIO(b"a,b\n1,x\n"), {}, "exports/day.csv") == [
+            {"a": "1", "b": "x"}
+        ]
+
+    def test_gzipped_json_lines_named_json_are_read(self):
+        assert _rows(
+            _gz(b'{"a": "1"}\n'), {"format": "jsonl"}, "exports/day.json"
+        ) == [{"a": "1"}]
+
+    def test_empty_file_is_not_gzip(self):
+        assert _rows(io.BytesIO(b""), {}, "exports/day.csv") == []
+
+
+class TestEscapeChar:
+    SPEC = {"escape_char": "\\"}
+
+    def test_escaped_delimiter_stays_in_the_value(self):
+        data = b"hit,type\n[Ready # Yes\\, I'm ready] - button,feature\n"
+        assert _rows(io.BytesIO(data), self.SPEC, "day.csv") == [
+            {"hit": "[Ready # Yes, I'm ready] - button", "type": "feature"}
+        ]
+
+    def test_without_it_the_value_is_split(self):
+        # Why the setting exists: the library reader cuts the value at the comma.
+        data = b"hit,type\nYes\\, ready,feature\n"
+        assert _rows(io.BytesIO(data), {}, "day.csv") == [
+            {"hit": "Yes\\", "type": " ready", "_sdc_extra": ["feature"]}
+        ]
+
+    def test_quote_marks_are_ordinary_characters(self):
+        data = b'hit,type\n"Payroll" page,page\n/ Payroll - "Payroll",page\n'
+        assert _rows(io.BytesIO(data), self.SPEC, "day.csv") == [
+            {"hit": '"Payroll" page', "type": "page"},
+            {"hit": '/ Payroll - "Payroll"', "type": "page"},
+        ]
+
+    def test_gzipped_file_named_csv_with_escapes(self):
+        data = b"hit,type\nYes\\, ready,feature\n"
+        assert _rows(_gz(data), self.SPEC, "day.csv") == [
+            {"hit": "Yes, ready", "type": "feature"}
+        ]
+
+    def test_other_delimiter(self):
+        data = b"a~b\nx\\~y~z\n"
+        assert _rows(io.BytesIO(data), {**self.SPEC, "delimiter": "~"}, "d.csv") == [
+            {"a": "x~y", "b": "z"}
+        ]
+
+    def test_extra_fields_and_null_bytes_as_the_library_does(self):
+        data = b"a,b\n1\x00,2,3\n"
+        assert _rows(io.BytesIO(data), self.SPEC, "day.csv") == [
+            {"a": "1", "b": "2", "_sdc_extra": ["3"]}
+        ]
+
+    def test_missing_key_properties_header_raises(self):
+        with pytest.raises(ValueError, match="missing required headers"):
+            _rows(io.BytesIO(b"a,b\n1,2\n"), {**self.SPEC, "key_properties": ["id"]}, "d.csv")
+
+    def test_config_accepts_it(self):
+        from tap_s3_csv.config import CONFIG_CONTRACT
+
+        CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": "\\"}])
+
+    def test_config_rejects_more_than_one_character(self):
+        from voluptuous import Invalid
+
+        from tap_s3_csv.config import CONFIG_CONTRACT
+
+        for bad in ("\\\\", ""):
+            with pytest.raises(Invalid):
+                CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": bad}])
+
+
+class TestKeysTheSampleMissed:
+    SDC = ["_sdc_source_bucket", "_sdc_source_file", "_sdc_source_lineno"]
+
+    def _sync(self, monkeypatch, lines, known):
+        written, schemas = [], []
+        payload = "\n".join(json.dumps(r) for r in lines).encode()
+        monkeypatch.setattr(s3, "get_file_handle", lambda config, path: _FakeHandle(_gz(payload)))
+        monkeypatch.setattr(sync, "write_record", lambda name, rec, time_extracted=None: written.append(rec))
+        monkeypatch.setattr(sync, "write_schema", lambda name, schema, keys: schemas.append((name, sorted(schema["properties"]), keys)))
+        stream = {
+            "schema": {"type": "object", "properties": {k: {"type": ["null", "string"]} for k in known + self.SDC}},
+            "metadata": [{"breadcrumb": [], "metadata": {"selected": True, "table-key-properties": ["event_key"]}}],
+        }
+        count = sync.sync_table_file({"bucket": "b"}, "day.json.gz", {"table_name": "events", "format": "jsonl"}, stream)
+        return count, written, schemas
+
+    def test_a_rare_key_is_kept_on_every_row_that_has_it(self, monkeypatch):
+        lines = [{"event_key": "1"}, {"event_key": "2", "template": "Org chart"}, {"event_key": "3", "template": "Kanban"}]
+        count, written, schemas = self._sync(monkeypatch, lines, ["event_key"])
+        assert count == 3
+        assert [r.get("template") for r in written] == [None, "Org chart", "Kanban"]
+        # The schema is sent again once, with the new key, before the first row that has it.
+        assert schemas == [("events", sorted(["event_key", "template"] + self.SDC), ["event_key"])]
+
+    def test_no_new_key_sends_no_new_schema(self, monkeypatch):
+        count, written, schemas = self._sync(monkeypatch, [{"event_key": "1", "template": "x"}], ["event_key", "template"])
+        assert (count, schemas) == (1, [])
+        assert written[0]["template"] == "x"
+
+    def test_a_key_differing_only_in_case_goes_into_the_known_spelling(self, monkeypatch):
+        # Two spellings of one name would be one column in Redshift and fail the load.
+        lines = [{"event_key": "1", "Email": "a@x"}, {"event_key": "2", "email": "b@x", "EMAIL": "c@x"}]
+        count, written, schemas = self._sync(monkeypatch, lines, ["event_key", "email"])
+        assert (count, schemas) == (2, [])
+        assert [{k: v for k, v in r.items() if not k.startswith("_sdc")} for r in written] == [
+            {"event_key": "1", "email": "a@x"}, {"event_key": "2", "email": "b@x"}
+        ]
+
+    def test_two_new_spellings_become_one_column(self, monkeypatch):
+        lines = [{"event_key": "1", "Tmpl": "a"}, {"event_key": "2", "tmpl": "b"}]
+        count, written, schemas = self._sync(monkeypatch, lines, ["event_key"])
+        assert [r.get("Tmpl") for r in written] == ["a", "b"]
+        assert all("tmpl" not in r for r in written)
+        assert schemas == [("events", sorted(["event_key", "Tmpl"] + self.SDC), ["event_key"])]
 
 
 class TestBucketUrl:
