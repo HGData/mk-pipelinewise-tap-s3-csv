@@ -29,6 +29,27 @@ LOGGER = get_logger("tap_s3_csv")
 
 GZIP_MAGIC = b"\x1f\x8b"
 
+
+class EndIsEmpty(io.RawIOBase):
+    """
+    The S3 body as a plain raw stream. The body boto3 hands back (urllib3)
+    closes itself once all its bytes are read, and io.BufferedReader treats a
+    closed raw stream as "read of closed file" rather than as the end of the
+    data. This reports the end as an empty read, as a file does.
+    """
+
+    def __init__(self, stream):
+        super().__init__()
+        self._stream = stream
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer) -> int:
+        data = self._stream.read(len(buffer)) or b""
+        buffer[: len(data)] = data
+        return len(data)
+
 SDC_SOURCE_BUCKET_COLUMN = "_sdc_source_bucket"
 SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
 SDC_SOURCE_LINENO_COLUMN = "_sdc_source_lineno"
@@ -168,7 +189,10 @@ def row_iterators_for_table(file_handle, table_spec: Dict, s3_path: str):
     file's first two bytes: some customers send gzipped files named .csv,
     which Redshift's COPY ... GZIP read whatever the name.
     """
-    stream = io.BufferedReader(file_handle._raw_stream)  # pylint:disable=protected-access
+    stream = io.BufferedReader(
+        EndIsEmpty(file_handle._raw_stream),  # pylint:disable=protected-access
+        buffer_size=1 << 20,
+    )
     file_name = s3_path
     if not s3_path.endswith((".gz", ".zip")) and stream.peek(2)[:2] == GZIP_MAGIC:
         file_name = s3_path + ".gz"

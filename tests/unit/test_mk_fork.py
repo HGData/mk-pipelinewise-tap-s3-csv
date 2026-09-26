@@ -90,6 +90,46 @@ def _rows(stream, table_spec, s3_path):
     return [dict(r) for reader in readers for r in reader]
 
 
+class _SelfClosingBody:
+    """Like the urllib3 body behind boto3's StreamingBody: it closes itself once all its bytes are read."""
+
+    def __init__(self, data: bytes):
+        self._buf, self._size, self.closed = io.BytesIO(data), len(data), False
+
+    def readable(self):
+        return True
+
+    def read(self, amt=-1):
+        data = self._buf.read(amt)
+        self.closed = self._buf.tell() >= self._size
+        return data
+
+    def readinto(self, buffer):
+        data = self.read(len(buffer))
+        buffer[: len(data)] = data
+        return len(data)
+
+
+class TestS3BodyThatClosesItself:
+    # The real S3 body closes itself at the end of its data; reading it must end the rows, not raise
+    # "read of closed file" (which is what broke the first dev pulls of this change).
+    def test_gzipped_csv_named_csv(self):
+        assert _rows(_SelfClosingBody(_gz(b"a,b\n1,x\n").getvalue()), {}, "day.csv") == [{"a": "1", "b": "x"}]
+
+    def test_plain_csv(self):
+        assert _rows(_SelfClosingBody(b"a,b\n1,x\n2,y\n"), {}, "day.csv") == [
+            {"a": "1", "b": "x"}, {"a": "2", "b": "y"}
+        ]
+
+    def test_json_lines(self):
+        assert _rows(_SelfClosingBody(b'{"a": "1"}\n{"a": "2"}\n'), {"format": "jsonl"}, "d.json") == [
+            {"a": "1"}, {"a": "2"}
+        ]
+
+    def test_escaped_csv(self):
+        assert _rows(_SelfClosingBody(b"a,b\nx\\,y,z\n"), {"escape_char": "\\"}, "d.csv") == [{"a": "x,y", "b": "z"}]
+
+
 class TestGzipFromContent:
     def test_gzipped_csv_named_csv_is_read(self):
         assert _rows(_gz(b"a,b\n1,x\n"), {}, "exports/day.csv") == [
