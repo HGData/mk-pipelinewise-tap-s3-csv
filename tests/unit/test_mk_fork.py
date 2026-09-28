@@ -205,9 +205,23 @@ class TestEscapeChar:
 
         from tap_s3_csv.config import CONFIG_CONTRACT
 
-        for bad in ("\\\\", ""):
-            with pytest.raises(Invalid):
-                CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": bad}])
+        with pytest.raises(Invalid):
+            CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": "\\\\"}])
+
+    def test_an_empty_escape_char_means_off(self):
+        # A cleared field is stored as "": the table reads as plain CSV instead of stopping the pull.
+        from tap_s3_csv.config import CONFIG_CONTRACT
+
+        CONFIG_CONTRACT([{"table_name": "t", "search_pattern": "x", "escape_char": ""}])
+        assert _rows(io.BytesIO(b"hit,type\nYes\\, ready,feature\n"), {"escape_char": ""}, "day.csv") == [
+            {"hit": "Yes\\", "type": " ready", "_sdc_extra": ["feature"]}
+        ]
+
+
+class TestOneSpellingPerName:
+    def test_the_sample_keeps_the_first_spelling(self):
+        schema = s3.generate_schema([{"Email": "a", "x": "1"}, {"email": "b"}, {"EMAIL": "c"}], {})
+        assert sorted(schema) == ["Email", "x"]
 
 
 class TestKeysTheSampleMissed:

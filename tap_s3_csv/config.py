@@ -26,7 +26,8 @@ CONFIG_CONTRACT = Schema(
             # marks are ordinary characters (see escaped_csv.py). Exactly one
             # character, as the csv reader needs: a doubled backslash in the
             # connector's JSON is caught here, not halfway through a pull.
-            Optional("escape_char"): All(str, Length(min=1, max=1)),
+            # Empty means off, as a cleared field is stored as "".
+            Optional("escape_char"): Any("", All(str, Length(min=1, max=1))),
             Optional("table_suffix"): str,
             Optional("remove_character"): str,
             Optional("s3_proxies"): object,

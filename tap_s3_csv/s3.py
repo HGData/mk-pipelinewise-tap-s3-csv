@@ -265,11 +265,17 @@ def generate_schema(samples: List[Dict], table_spec: Dict) -> Dict:
     :return: json schema dictionary representing  the table
     """
     schema = {}
+    spellings: Dict[str, str] = {}
     date_overrides = set(table_spec.get("date_overrides", []))
     datatype_overrides = set(table_spec.get("datatype_overrides", []))
 
     for sample in samples:
         for header in sample.keys():
+            # MadKudu addition: one spelling per name. Redshift folds column
+            # names to lower case, so a sample holding both "Email" and "email"
+            # would give two columns that clash as one. The first spelling
+            # wins, and sync.add_new_keys folds later spellings into it.
+            header = spellings.setdefault(header.lower(), header)
             schema[header] = {"type": ["null", "string"]}
 
             if header in date_overrides:
