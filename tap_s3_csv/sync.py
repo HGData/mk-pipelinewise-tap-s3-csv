@@ -43,10 +43,17 @@ def sync_stream(
         or config["start_date"]
     )
 
-    LOGGER.info('Syncing table "%s".', table_name)
-    LOGGER.info("Getting files modified since %s.", modified_since)
+    # The key of the last file finished in the bookmark's second. Many files
+    # can share one LastModified second; without the key, a run that stopped
+    # among them would skip the unfinished ones next time.
+    modified_since_key = get_bookmark(state, table_name, "modified_since_key")
 
-    s3_files = s3.get_input_files_for_table(config, table_spec, modified_since)
+    LOGGER.info('Syncing table "%s".', table_name)
+    LOGGER.info("Getting files modified since %s (after key %s).", modified_since, modified_since_key)
+
+    s3_files = s3.get_input_files_for_table(
+        config, table_spec, modified_since, modified_since_key
+    )
 
     records_streamed = 0
 
@@ -54,7 +61,7 @@ def sync_stream(
     # sense. This means that we can't sync s3 buckets that are larger than
     # we can sort in memory which is suboptimal. If we could bookmark
     # based on anything else then we could just sync files as we see them.
-    for s3_file in sorted(s3_files, key=lambda item: item["last_modified"]):
+    for s3_file in sorted(s3_files, key=lambda item: (item["last_modified"], item["key"])):
         records_streamed += sync_table_file(
             config, s3_file["key"], table_spec, stream
         )
@@ -65,6 +72,7 @@ def sync_stream(
             "modified_since",
             s3_file["last_modified"].isoformat(),
         )
+        state = write_bookmark(state, table_name, "modified_since_key", s3_file["key"])
         write_state(state)
 
     LOGGER.info(
