@@ -8,26 +8,34 @@ import io
 import itertools
 import os
 import re
-from typing import Dict, Generator, Iterator, List, Optional
+import time
+from typing import Dict, Generator, List, Optional
 
 import backoff
 import boto3
 import more_itertools
 from botocore.config import Config
 from botocore.credentials import DeferredRefreshableCredentials
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, HTTPClientError
 from botocore.session import get_session as get_botocore_session
 from singer import get_logger
 from singer_encodings.csv import (  # pylint:disable=no-name-in-module
     SDC_EXTRA_COLUMN,
     get_row_iterators,
 )
+from urllib3.exceptions import ProtocolError, ReadTimeoutError
 
 from tap_s3_csv import escaped_csv, jsonl
 
 LOGGER = get_logger("tap_s3_csv")
 
 GZIP_MAGIC = b"\x1f\x8b"
+
+# A read that breaks part-way through a file ("Connection broken", a reset or a
+# timeout) is resumed from the byte reached, instead of failing the whole run.
+BROKEN_READ_ERRORS = (ProtocolError, ReadTimeoutError, ConnectionError, HTTPClientError)
+# Tries in a row that read nothing before giving up; the wait doubles each time.
+READ_RETRIES = 5
 
 
 class EndIsEmpty(io.RawIOBase):
@@ -36,19 +44,72 @@ class EndIsEmpty(io.RawIOBase):
     closes itself once all its bytes are read, and io.BufferedReader treats a
     closed raw stream as "read of closed file" rather than as the end of the
     data. This reports the end as an empty read, as a file does.
+
+    With a reopen function (see S3FileHandle) a broken read is resumed from the
+    byte reached, so the rows come out as if the connection had never broken.
     """
 
-    def __init__(self, stream):
+    def __init__(self, stream, reopen=None):
         super().__init__()
         self._stream = stream
+        self._reopen = reopen
+        self._position = 0
 
     def readable(self) -> bool:
         return True
 
     def readinto(self, buffer) -> int:
-        data = self._stream.read(len(buffer)) or b""
+        failures = 0
+        while True:
+            try:
+                data = self._stream.read(len(buffer)) or b""
+                break
+            except BROKEN_READ_ERRORS as err:
+                if self._reopen is None:
+                    raise
+                failures = self._open_again(err, failures)
         buffer[: len(data)] = data
+        self._position += len(data)
         return len(data)
+
+    def _open_again(self, error, failures: int) -> int:
+        """Open the file again from the byte reached. A reopen that fails is one more try."""
+        while True:
+            failures += 1
+            if failures > READ_RETRIES:
+                raise error
+            LOGGER.warning(
+                "Read broke at byte %s (%r); opening the file again from there, try %s of %s.",
+                self._position, error, failures, READ_RETRIES,
+            )
+            time.sleep(2 ** (failures - 1))
+            try:
+                self._stream = self._reopen(self._position)
+                return failures
+            except BROKEN_READ_ERRORS as err:
+                error = err
+
+
+class S3FileHandle:
+    """
+    The body of one S3 file, plus a way to open the same file again from a
+    byte offset. The new read must match the file's ETag, so a file that was
+    replaced in the meantime fails (S3 answers 412) rather than being joined
+    from two versions; the next run then reads it again from the start.
+    """
+
+    def __init__(self, s3_object, response: Dict):
+        self._s3_object = s3_object
+        self._etag = response["ETag"]
+        self._size = response["ContentLength"]
+        self._raw_stream = response["Body"]._raw_stream  # pylint:disable=protected-access
+
+    def reopen(self, position: int):
+        if position >= self._size:
+            return io.BytesIO(b"")
+        response = self._s3_object.get(Range=f"bytes={position}-", IfMatch=self._etag)
+        return response["Body"]._raw_stream  # pylint:disable=protected-access
+
 
 SDC_SOURCE_BUCKET_COLUMN = "_sdc_source_bucket"
 SDC_SOURCE_FILE_COLUMN = "_sdc_source_file"
@@ -190,7 +251,10 @@ def row_iterators_for_table(file_handle, table_spec: Dict, s3_path: str):
     which Redshift's COPY ... GZIP read whatever the name.
     """
     stream = io.BufferedReader(
-        EndIsEmpty(file_handle._raw_stream),  # pylint:disable=protected-access
+        EndIsEmpty(
+            file_handle._raw_stream,  # pylint:disable=protected-access
+            reopen=getattr(file_handle, "reopen", None),
+        ),
         buffer_size=1 << 20,
     )
     file_name = s3_path
@@ -396,8 +460,11 @@ def sample_files(
         )
 
 
-def get_input_files_for_table(
-    config: Dict, table_spec: Dict, modified_since: Optional[str] = None
+def get_input_files_for_table(  # pylint:disable=too-many-locals
+    config: Dict,
+    table_spec: Dict,
+    modified_since: Optional[str] = None,
+    modified_since_key: Optional[str] = None,
 ) -> Generator:
     """
     Gets all files that match the search pattern in table specs and were
@@ -405,6 +472,9 @@ def get_input_files_for_table(
     :param config: tap config
     :param table_spec: table specs
     :param modified_since: string date
+    :param modified_since_key: key of the last file finished at modified_since.
+        Files modified in that same second with a later key are not finished
+        yet and are still returned. Without it, that second is skipped whole.
     :returns: generator containing all the found files
     """
     bucket = config["bucket"]
@@ -455,7 +525,15 @@ def get_input_files_for_table(
 
         if matcher.search(key):
             matched_files_count += 1
-            if modified_since is None or modified_since < last_modified:
+            if (
+                modified_since is None
+                or modified_since < last_modified
+                or (
+                    modified_since == last_modified
+                    and modified_since_key is not None
+                    and key > modified_since_key
+                )
+            ):
                 LOGGER.info(
                     'Will download key "%s" as it was last modified %s',
                     key,
@@ -578,12 +656,12 @@ def list_files_in_bucket(
 
 
 @retry_pattern()
-def get_file_handle(config: Dict, s3_path: str) -> Iterator:
+def get_file_handle(config: Dict, s3_path: str) -> S3FileHandle:
     """
     Get a iterator of file located in the s3 path
     :param config: tap config
     :param s3_path: file path in S3
-    :return: file Body iterator
+    :return: the file body, which can be opened again from a byte offset
     """
     bucket = config["bucket"]
     aws_endpoint_url = config.get("aws_endpoint_url")
@@ -611,4 +689,4 @@ def get_file_handle(config: Dict, s3_path: str) -> Iterator:
 
     s3_bucket = s3_client.Bucket(bucket)
     s3_object = s3_bucket.Object(s3_path)
-    return s3_object.get()["Body"]
+    return S3FileHandle(s3_object, s3_object.get())
